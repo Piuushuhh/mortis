@@ -1,0 +1,12 @@
+{
+  "manifest_version": 3,
+  "name": "Mortis Page Bridge",
+  "version": "1.0.0",
+  "description": "Explicitly arm a browser tab for local Mortis capture.",
+  "permissions": ["activeTab", "scripting", "nativeMessaging", "storage"],
+  "background": {"service_worker": "service_worker.js"},
+  "action": {
+    "default_title": "Arm this page for Mortis",
+    "default_popup": "popup.html"
+  }
+}

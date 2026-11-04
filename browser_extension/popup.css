@@ -1,0 +1,17 @@
+* { box-sizing: border-box; }
+body { margin: 0; width: 300px; background: #0a1420; color: #e4f1f7; font: 13px "Segoe UI", sans-serif; }
+main { padding: 16px; }
+header { display: flex; align-items: center; gap: 10px; margin-bottom: 14px; }
+.mark { display: grid; place-items: center; width: 34px; height: 34px; border: 1px solid #3985a0; border-radius: 50%; color: #8ce9fa; font-weight: 800; box-shadow: 0 0 12px #12627a; }
+header strong, header small { display: block; letter-spacing: .12em; }
+header strong { color: #a6f3ff; font-size: 12px; }
+header small { color: #7893a4; font-size: 9px; margin-top: 2px; }
+.state { padding: 8px 10px; border: 1px solid #24495e; border-radius: 8px; color: #8fd7e8; background: #0e2030; }
+.state[data-state="connected"] { color: #9cf2b6; border-color: #287c60; }
+.state[data-state="disconnected"] { color: #ffb3a9; border-color: #81413a; }
+.page { min-height: 50px; margin: 10px 0; padding: 9px; border-radius: 8px; background: #0e1c2a; color: #aebfca; line-height: 1.4; overflow-wrap: anywhere; }
+button { width: 100%; margin-top: 8px; padding: 9px; border: 1px solid #347b93; border-radius: 7px; background: #123b50; color: #d8f7ff; font-weight: 650; cursor: pointer; }
+button:hover { background: #1a5368; }
+button.secondary { background: #101d2a; color: #91a8b6; border-color: #2b4352; }
+.message { min-height: 16px; color: #ffb3a9; font-size: 11px; }
+footer { border-top: 1px solid #1e3443; padding-top: 9px; color: #647f90; font-size: 10px; }

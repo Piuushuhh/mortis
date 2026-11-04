@@ -1,0 +1,76 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual Environments
+.venv/
+venv/
+ENV/
+env/
+
+# Local configuration and credentials
+.env
+.env.*
+!.env.example
+*.pem
+*.p12
+*.pfx
+*.key
+
+# Godot Engine
+.godot/
+*.translation
+
+# Databases & User Knowledge (Local Privacy)
+*.db
+*.sqlite
+*.sqlite3
+spider_knowledge.db
+
+# Audio / Temp / Logs
+*.wav
+*.error
+*.log
+tmp/
+temp/
+
+# Backups
+*.bak
+*.bak.*
+backups/
+
+# Operating System & IDEs
+Thumbs.db
+Desktop.ini
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*~
+
+# Native Build Artifacts
+*.obj
+*.o
+*.exe
+*.dll
+*.pyd
