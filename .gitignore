@@ -1,5 +1,10 @@
 # Python
 __pycache__/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
 *.py[cod]
 *$py.class
 *.so
@@ -43,16 +48,23 @@ env/
 
 # Databases & User Knowledge (Local Privacy)
 *.db
+*.db-*
 *.sqlite
+*.sqlite-*
 *.sqlite3
+*.sqlite3-*
 spider_knowledge.db
 
 # Audio / Temp / Logs
 *.wav
 *.error
 *.log
+*.log.*
+logs/
 tmp/
 temp/
+node_modules/
+.ipynb_checkpoints/
 
 # Backups
 *.bak
@@ -74,3 +86,7 @@ Desktop.ini
 *.exe
 *.dll
 *.pyd
+*.pdb
+*.ilk
+*.lib
+*.exp

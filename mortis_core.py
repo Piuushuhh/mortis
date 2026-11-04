@@ -8,7 +8,7 @@ import sqlite3
 import time
 from collections import deque
 from datetime import datetime
-from urllib.parse import urldefrag, urljoin, urlparse
+from urllib.parse import urldefrag, urljoin, urlparse, urlunparse
 from urllib.robotparser import RobotFileParser
 
 import requests
@@ -18,7 +18,7 @@ from mortis_control import write_status
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 DB = os.path.join(ROOT, "spider_knowledge.db")
-OLLAMA = os.environ.get("OLLAMA_URL", "http://localhost:11434")
+OLLAMA = os.environ.get("OLLAMA_URL", "http://localhost:11434").rstrip("/")
 CHAT_DEFAULT = "llama3.2"
 EMBED_DEFAULT = "nomic-embed-text"
 UA = "AIWebSpider/1.0 (personal research crawler)"
@@ -28,6 +28,76 @@ MAX_CAPTURE_LINKS = 300
 
 class CrawlStopped(Exception):
     """Raised when a crawl is cancelled before a page is committed."""
+
+
+class OllamaError(RuntimeError):
+    """A user-facing local model service or model error."""
+
+    def __init__(self, message, status_code=None):
+        super().__init__(message)
+        self.status_code = status_code
+
+
+def _ollama_post(path, payload, timeout):
+    try:
+        response = requests.post(
+            OLLAMA + path, json=payload, timeout=timeout
+        )
+    except requests.ConnectionError as error:
+        raise OllamaError(
+            "Cannot connect to Ollama. Start the service or verify OLLAMA_URL."
+        ) from error
+    except requests.Timeout as error:
+        raise OllamaError(
+            f"Ollama request to {path} timed out. Check that the selected model is responsive."
+        ) from error
+    except requests.RequestException as error:
+        raise OllamaError(
+            f"Ollama request to {path} failed. Check the endpoint and model settings."
+        ) from error
+
+    try:
+        response.raise_for_status()
+    except requests.HTTPError as error:
+        model = payload.get("model")
+        try:
+            error_payload = response.json()
+            detail = error_payload.get("error") if isinstance(error_payload, dict) else None
+        except (AttributeError, ValueError, TypeError):
+            detail = None
+        message = f"Ollama returned HTTP {response.status_code} for {path}"
+        if model:
+            message += f" using model '{model}'"
+        if detail:
+            message += f": {str(detail)[:240]}"
+        if response.status_code == 404 and model:
+            message += f". Install it with: ollama pull {model}"
+        raise OllamaError(message, response.status_code) from error
+    return response
+
+
+def _ollama_json(response, path):
+    try:
+        payload = response.json()
+    except (ValueError, TypeError) as error:
+        raise OllamaError(f"Ollama returned invalid JSON for {path}.") from error
+    if not isinstance(payload, dict):
+        raise OllamaError(f"Ollama returned an invalid response for {path}.")
+    return payload
+
+
+def _validate_embedding(vector, model):
+    if (
+        not isinstance(vector, list)
+        or not vector
+        or any(not isinstance(value, (int, float)) or not math.isfinite(value)
+               for value in vector)
+    ):
+        raise OllamaError(
+            f"Ollama returned an invalid embedding for '{model}'. "
+            "Check that the selected model supports embeddings."
+        )
+    return vector
 
 
 def conn(db_path=None):
@@ -101,9 +171,9 @@ def conversational_response(question, chatmodel, history=None):
         if isinstance(content, str) and content.strip():
             messages.append({"role": item["role"], "content": content[:1600]})
     messages.append({"role": "user", "content": str(question)[:2000]})
-    response = requests.post(
-        OLLAMA + "/api/chat",
-        json={
+    response = _ollama_post(
+        "/api/chat",
+        {
             "model": chatmodel,
             "messages": messages,
             "stream": False,
@@ -111,30 +181,36 @@ def conversational_response(question, chatmodel, history=None):
         },
         timeout=90,
     )
-    response.raise_for_status()
-    answer = response.json().get("message", {}).get("content", "").strip()
-    if not answer:
-        raise RuntimeError("The local model returned an empty response.")
-    return answer
+    payload = _ollama_json(response, "/api/chat")
+    message = payload.get("message")
+    answer = message.get("content") if isinstance(message, dict) else None
+    if not isinstance(answer, str) or not answer.strip():
+        raise OllamaError("The local model returned an empty response.")
+    return answer.strip()
 
 
 def embed(text, model):
-    response = requests.post(
-        OLLAMA + "/api/embed",
-        json={"model": model, "input": text[:6000]},
-        timeout=(5, 60),
-    )
-    response.raise_for_status()
-    if response.json().get("embeddings"):
-        return response.json()["embeddings"][0]
+    try:
+        response = _ollama_post(
+            "/api/embed", {"model": model, "input": text[:6000]}, (5, 60)
+        )
+        payload = _ollama_json(response, "/api/embed")
+        embeddings = payload.get("embeddings")
+        if isinstance(embeddings, list) and embeddings:
+            return _validate_embedding(embeddings[0], model)
+        raise OllamaError(
+            f"Ollama returned no embedding for '{model}'. Check that it is an embedding model."
+        )
+    except OllamaError as error:
+        if error.status_code not in {404, 405}:
+            raise
 
-    response = requests.post(
-        OLLAMA + "/api/embeddings",
-        json={"model": model, "prompt": text[:6000]},
-        timeout=(5, 60),
+    response = _ollama_post(
+        "/api/embeddings", {"model": model, "prompt": text[:6000]}, (5, 60)
     )
-    response.raise_for_status()
-    return response.json()["embedding"]
+    payload = _ollama_json(response, "/api/embeddings")
+    vector = payload.get("embedding")
+    return _validate_embedding(vector, model)
 
 
 def chunks(text, size=900, overlap=130):
@@ -152,7 +228,9 @@ def chunks(text, size=900, overlap=130):
         if end >= len(text):
             break
         start = max(start + 1, end - overlap)
-    return output
+    # Repeated boilerplate or duplicated sections should not create identical
+    # embeddings for the same page. Preserve the first occurrence and ordering.
+    return list(dict.fromkeys(output))
 
 
 def cos(first, second):
@@ -165,10 +243,29 @@ def cos(first, second):
 
 
 def cleanurl(url):
-    url = urldefrag(url)[0]
-    parsed = urlparse(url)
-    if parsed.scheme not in ("http", "https"):
+    if not isinstance(url, str):
         return None
+    try:
+        parsed = urlparse(urldefrag(url.strip())[0])
+    except ValueError:
+        return None
+    scheme = parsed.scheme.lower()
+    if scheme not in ("http", "https") or "@" in parsed.netloc:
+        return None
+    try:
+        hostname = parsed.hostname
+        port = parsed.port
+    except ValueError:
+        return None
+    if not hostname:
+        return None
+    hostname = hostname.lower()
+    if ":" in hostname and not hostname.startswith("["):
+        hostname = f"[{hostname}]"
+    if port is not None and port != (80 if scheme == "http" else 443):
+        hostname = f"{hostname}:{port}"
+    url = urlunparse((scheme, hostname, parsed.path or "/", parsed.params, parsed.query, ""))
+    parsed = urlparse(url)
     excluded = (
         ".css", ".js", ".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico",
         ".woff", ".woff2", ".zip", ".gz", ".mp4", ".mp3", ".exe", ".map",
@@ -241,12 +338,15 @@ def robots_for(url, session):
     parser = RobotFileParser()
     parser.set_url(robots_url)
     try:
-        response = session.get(robots_url, timeout=12, headers={"User-Agent": UA})
+        response = session.get(
+            robots_url, timeout=12, headers={"User-Agent": UA},
+            allow_redirects=False,
+        )
         if response.status_code == 404:
             parser.parse([])
         elif response.status_code in (401, 403):
             parser.parse(["User-agent: *", "Disallow: /"])
-        elif response.ok:
+        elif 200 <= response.status_code < 300:
             parser.parse(response.text.splitlines())
         else:
             parser.parse(["User-agent: *", "Disallow: /"])
@@ -335,7 +435,23 @@ def crawl(
                 continue
             try:
                 log("FETCH " + url)
-                with session.get(url, timeout=15, stream=True) as response:
+                with session.get(url, timeout=15, stream=True, allow_redirects=False) as response:
+                    if response.status_code in {301, 302, 303, 307, 308}:
+                        location = response.headers.get("Location")
+                        redirect = cleanurl(urljoin(url, location)) if location else None
+                        if not redirect or urlparse(redirect).netloc.lower() != host:
+                            log(f"SKIP off-site or invalid redirect from {url}")
+                            done += 1
+                            progress(done, limit, indexed_chunks)
+                        elif redirect in seen:
+                            log(f"SKIP redirect loop to {redirect}")
+                            done += 1
+                            progress(done, limit, indexed_chunks)
+                        else:
+                            seen.add(redirect)
+                            pending.appendleft((redirect, depth))
+                            log(f"REDIRECT {url} -> {redirect}")
+                        continue
                     content_type = response.headers.get("Content-Type", "").lower()
                     if "html" not in content_type:
                         log("SKIP non-HTML " + url)
@@ -390,11 +506,12 @@ def crawl(
                 done += 1
                 progress(done, limit, indexed_chunks)
 
-            remaining = max(0.0, float(delay))
-            while remaining > 0 and not should_stop():
-                interval = min(0.1, remaining)
-                time.sleep(interval)
-                remaining -= interval
+            finally:
+                remaining = max(0.0, float(delay))
+                while remaining > 0 and not should_stop():
+                    interval = min(0.1, remaining)
+                    time.sleep(interval)
+                    remaining -= interval
         if should_stop():
             cancelled = True
         log(f"DONE: {done} pages processed, {indexed_chunks} chunks indexed.")
@@ -407,6 +524,17 @@ def crawl(
 def stop_requested():
     path = os.environ.get("MORTIS_STOP_FILE")
     return bool(path and os.path.exists(path))
+
+
+def validate_citations(answer, source_count):
+    """Do not display a generated answer with missing or unresolvable citations."""
+    references = [int(value) for value in re.findall(r"\[Source\s+(\d{1,3})\]", answer, re.I)]
+    if not references or any(index < 1 or index > source_count for index in references):
+        return (
+            "I couldn't verify the model's answer with valid citations. "
+            "Review the retrieved passages below or try rephrasing the question."
+        )
+    return answer
 
 
 def savepage(url, title, body, status, model, should_stop=None, db_path=None):
@@ -459,18 +587,38 @@ def ask(question, chatmodel, embedmodel, db_path=None, history=None):
     connection = conn(db_path)
     try:
         rows = connection.execute(
-            "SELECT url,title,body,vec FROM chunks"
+            "SELECT url,title,body,vec FROM chunks ORDER BY id"
         ).fetchall()
     finally:
         connection.close()
 
-    ranked = sorted(
-        [
-            (cos(query_vector, json.loads(vector)), url, title, body)
-            for url, title, body, vector in rows
-        ],
-        reverse=True,
-    )[:5]
+    candidates = []
+    for url, title, body, encoded_vector in rows:
+        try:
+            vector = json.loads(encoded_vector)
+        except (TypeError, json.JSONDecodeError):
+            continue
+        if (
+            not isinstance(vector, list)
+            or len(vector) != len(query_vector)
+            or not vector
+            or any(not isinstance(value, (int, float)) or not math.isfinite(value)
+                   for value in vector)
+            or not isinstance(body, str)
+        ):
+            continue
+        candidates.append((cos(query_vector, vector), url, title, body))
+
+    ranked = []
+    seen_passages = set()
+    for candidate in sorted(candidates, key=lambda item: item[0], reverse=True):
+        passage_key = re.sub(r"\s+", " ", candidate[3]).strip().casefold()
+        if not passage_key or passage_key in seen_passages:
+            continue
+        seen_passages.add(passage_key)
+        ranked.append(candidate)
+        if len(ranked) == 5:
+            break
     if not ranked:
         return "No indexed passages found. Crawl a website first.", []
 
@@ -495,9 +643,9 @@ def ask(question, chatmodel, embedmodel, db_path=None, history=None):
         + "\n\nQuestion: "
         + question
     )
-    response = requests.post(
-        OLLAMA + "/api/chat",
-        json={
+    response = _ollama_post(
+        "/api/chat",
+        {
             "model": chatmodel,
             "messages": [{"role": "user", "content": prompt}],
             "stream": False,
@@ -505,6 +653,9 @@ def ask(question, chatmodel, embedmodel, db_path=None, history=None):
         },
         timeout=180,
     )
-    response.raise_for_status()
-    answer = response.json().get("message", {}).get("content", "No answer returned.")
-    return answer, ranked
+    payload = _ollama_json(response, "/api/chat")
+    message = payload.get("message")
+    answer = message.get("content") if isinstance(message, dict) else None
+    if not isinstance(answer, str) or not answer.strip():
+        raise OllamaError("Ollama returned an empty or invalid answer.")
+    return validate_citations(answer, len(ranked)), ranked

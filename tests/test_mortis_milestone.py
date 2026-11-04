@@ -21,6 +21,7 @@ from mortis_native_host import read_frame, run_host, write_frame
 
 class FixtureHandler(BaseHTTPRequestHandler):
     hits = []
+    redirect_target_url = None
     pages = {
         "/root": (
             '<main><h1>Root page</h1><p>Root fixture has enough readable material to '
@@ -56,6 +57,15 @@ class FixtureHandler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(body)
             return
+        if self.path in {"/redirect-offsite", "/redirect-internal"}:
+            self.send_response(302)
+            location = (
+                type(self).redirect_target_url
+                if self.path == "/redirect-offsite" else "/allowed"
+            )
+            self.send_header("Location", location)
+            self.end_headers()
+            return
         page = self.pages.get(self.path)
         if page is None:
             self.send_error(404)
@@ -85,6 +95,7 @@ class MortisMilestoneTests(unittest.TestCase):
         })
         self.env_patch.start()
         self.addCleanup(self.env_patch.stop)
+        self.original_embed = core.embed
         self.embed_patch = patch.object(core, "embed", lambda _text, _model: [1.0, 0.0, 0.0])
         self.embed_patch.start()
         self.addCleanup(self.embed_patch.stop)
@@ -154,8 +165,164 @@ class MortisMilestoneTests(unittest.TestCase):
         core.capture_page(url, "Stored", "This page has enough readable body text for retrieval and testing. " * 2,
                           [], "nomic-embed-text", db_path=self.db)
         with patch.object(core.requests, "post", side_effect=requests.ConnectionError("Ollama unavailable")):
-            with self.assertRaises(requests.ConnectionError):
+            with self.assertRaisesRegex(core.OllamaError, "Cannot connect to Ollama"):
                 core.ask("Question", "llama3.2", "nomic-embed-text", db_path=self.db)
+
+    def test_ollama_missing_model_error_is_actionable(self):
+        class MissingModel:
+            status_code = 404
+            def raise_for_status(self):
+                raise requests.HTTPError("Not Found")
+            def json(self):
+                return {"error": "model not found"}
+
+        with patch.object(core.requests, "post", return_value=MissingModel()):
+            with self.assertRaisesRegex(core.OllamaError, "ollama pull llama3.2"):
+                core.conversational_response("Hello", "llama3.2")
+
+    def test_embedding_api_falls_back_to_legacy_endpoint(self):
+        class MissingEndpoint:
+            status_code = 404
+            def raise_for_status(self):
+                raise requests.HTTPError("Not Found")
+            def json(self):
+                return {"error": "not found"}
+
+        class LegacyEmbedding:
+            def raise_for_status(self):
+                pass
+            def json(self):
+                return {"embedding": [0.25, 0.75]}
+
+        with patch.object(core, "embed", self.original_embed):
+            with patch.object(
+                core.requests, "post", side_effect=[MissingEndpoint(), LegacyEmbedding()]
+            ) as request:
+                vector = core.embed("page text", "nomic-embed-text")
+        self.assertEqual(vector, [0.25, 0.75])
+        self.assertTrue(request.call_args_list[0].args[0].endswith("/api/embed"))
+        self.assertTrue(request.call_args_list[1].args[0].endswith("/api/embeddings"))
+
+    def test_url_and_chunk_normalization_prevent_duplicates(self):
+        self.assertEqual(
+            core.cleanurl("HTTP://Example.COM:80/research#section"),
+            "http://example.com/research",
+        )
+        self.assertEqual(core.cleanurl("https://example.com:443"), "https://example.com/")
+        self.assertIsNone(core.cleanurl("https://user:password@example.com/private"))
+        self.assertIsNone(core.cleanurl("https://example.com:invalid/"))
+        self.assertIsNone(core.cleanurl("http://[::1"))
+        self.assertEqual(core.cleanurl("http://example.com:0/"), "http://example.com:0/")
+        self.assertEqual(
+            core.chunks("abcdefghijabcdefghij", size=10, overlap=0),
+            ["abcdefghij"],
+        )
+
+    def test_retrieval_skips_corrupt_vectors_and_duplicate_passages(self):
+        url = "https://example.test/research"
+        body = "This research passage contains enough readable text for duplicate retrieval testing."
+        core.capture_page(url, "Research", body, [], "nomic-embed-text", db_path=self.db)
+        connection = core.conn(self.db)
+        connection.execute(
+            "INSERT INTO chunks(url,title,body,vec) VALUES(?,?,?,?)",
+            ("https://mirror.test/research", "Mirror", body, json.dumps([1.0, 0.0, 0.0])),
+        )
+        connection.execute(
+            "INSERT INTO chunks(url,title,body,vec) VALUES(?,?,?,?)",
+            ("https://broken.test/research", "Broken", "Corrupt vector row", "not-json"),
+        )
+        connection.commit()
+        connection.close()
+
+        class Response:
+            def raise_for_status(self):
+                pass
+            def json(self):
+                return {"message": {"content": "The passage supports this answer [Source 1]."}}
+
+        with patch.object(core.requests, "post", return_value=Response()):
+            answer, sources = core.ask(
+                "What does the passage say?", "llama3.2", "nomic-embed-text", db_path=self.db
+            )
+        self.assertIn("[Source 1]", answer)
+        self.assertEqual(len(sources), 1)
+        self.assertEqual(sources[0][1], url)
+
+    def test_retrieval_rejects_missing_or_invalid_source_citations(self):
+        url = "https://example.test/citations"
+        body = "This page contains enough source text to check the answer citation behavior."
+        core.capture_page(url, "Citations", body, [], "nomic-embed-text", db_path=self.db)
+
+        class Response:
+            answer = ""
+            def raise_for_status(self):
+                pass
+            def json(self):
+                return {"message": {"content": self.answer}}
+
+        for answer in ("Unsupported uncited claim.", "Unsupported claim [Source 8]."):
+            with self.subTest(answer=answer):
+                response = Response()
+                response.answer = answer
+                with patch.object(core.requests, "post", return_value=response):
+                    result, sources = core.ask(
+                        "What does this page say?", "llama3.2", "nomic-embed-text",
+                        db_path=self.db,
+                    )
+                self.assertIn("couldn't verify", result)
+                self.assertEqual(len(sources), 1)
+
+    def test_crawler_does_not_follow_offsite_redirects(self):
+        FixtureHandler.hits = []
+
+        class TargetHandler(BaseHTTPRequestHandler):
+            hits = []
+            def do_GET(self):
+                type(self).hits.append(self.path)
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html")
+                self.end_headers()
+                self.wfile.write(b"<main>This offsite content must never be fetched.</main>")
+            def log_message(self, *_args):
+                pass
+
+        target_server = ThreadingHTTPServer(("127.0.0.1", 0), TargetHandler)
+        target_thread = threading.Thread(target=target_server.serve_forever, daemon=True)
+        target_thread.start()
+        self.addCleanup(target_server.server_close)
+        self.addCleanup(target_server.shutdown)
+        FixtureHandler.redirect_target_url = f"http://127.0.0.1:{target_server.server_port}/target"
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), FixtureHandler)
+        server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+        server_thread.start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        root = f"http://127.0.0.1:{server.server_port}/redirect-offsite"
+        logs = []
+        done, count = core.crawl(
+            root, 4, 0, "nomic-embed-text", logs.append,
+            lambda *_args: None, db_path=self.db,
+        )
+        self.assertEqual((done, count), (1, 0))
+        self.assertEqual(TargetHandler.hits, [])
+        self.assertTrue(any("off-site" in message for message in logs))
+        connection = core.conn(self.db)
+        self.assertEqual(connection.execute("SELECT COUNT(*) FROM pages").fetchone()[0], 0)
+        connection.close()
+        done, count = core.crawl(
+            f"http://127.0.0.1:{server.server_port}/redirect-internal",
+            1, 0, "nomic-embed-text", logs.append,
+            lambda *_args: None, db_path=self.db,
+        )
+        self.assertEqual(done, 1)
+        self.assertGreater(count, 0)
+        connection = core.conn(self.db)
+        self.assertEqual(
+            connection.execute("SELECT url FROM pages").fetchone()[0],
+            f"http://127.0.0.1:{server.server_port}/allowed",
+        )
+        connection.close()
 
     def test_crawl_robots_depth_page_limit_and_graceful_stop(self):
         FixtureHandler.hits = []

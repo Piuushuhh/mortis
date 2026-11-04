@@ -1,8 +1,9 @@
 import os
+from html import escape
 from datetime import datetime
 import streamlit as st
 from mortis_control import ACTIVE_STATUSES, read_status, write_status
-from mortis_core import CHAT_DEFAULT, EMBED_DEFAULT, ask, conn, crawl, models
+from mortis_core import CHAT_DEFAULT, EMBED_DEFAULT, ask, cleanurl, conn, crawl, models
 
 st.set_page_config(page_title="AI Web Spider",page_icon="🕷️",layout="wide")
 st.markdown("""<style>
@@ -68,8 +69,12 @@ with right:
     if found:
      st.markdown("#### Retrieved sources")
      for i,(score,url,title,body) in enumerate(found,1):
-      with st.expander(f"[Source {i}] {title} · relevance {score:.3f}"):
-       st.markdown(f'<div class="source">{url}</div>',unsafe_allow_html=True); st.write(body); st.link_button("Open original page",url)
+      with st.expander(f"[Source {i}] relevance {score:.3f}"):
+       st.write(title)
+       st.markdown(f'<div class="source">{escape(url, quote=True)}</div>',unsafe_allow_html=True)
+       st.write(body)
+       safe_url=cleanurl(url)
+       if safe_url: st.link_button("Open original page",safe_url)
    except Exception as e: st.error(f"AI request failed: {e}")
 c=conn()
 pc=c.execute("SELECT COUNT(*) FROM pages").fetchone()[0]
@@ -82,7 +87,10 @@ with st.expander("📚 Browse collected pages"):
  if not rows: st.info("No pages yet. Start your first crawl.")
  for u,t,d,s,n in rows:
   source_status="Browser capture" if s==0 else f"HTTP {s}"
-  st.markdown(f"**{t}**"); st.markdown(f'<div class="source">{u}</div>',unsafe_allow_html=True); st.caption(f"HTTP {s} · {n:,} characters · {d}"); st.divider()
+  st.write(t)
+  st.markdown(f'<div class="source">{escape(u, quote=True)}</div>',unsafe_allow_html=True)
+  st.caption(f"{source_status} · {n:,} characters · {d}")
+  st.divider()
 with st.expander("🧹 Manage local knowledge base"):
  st.caption("Deletes the local database stored beside this app.")
  if st.button("Delete all collected data"):
